@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "YouNope",
+  "version": "1.0",
+  "description": "Block YouTube channels. Never see their videos again.",
+  "permissions": ["storage", "activeTab"],
+  "content_scripts": [
+    {
+      "matches": ["*://*.youtube.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": "icon48.png"
+  },
+  "options_page": "options.html",
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}

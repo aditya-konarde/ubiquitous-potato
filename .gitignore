@@ -1,0 +1,21 @@
+# Build outputs
+**/target/
+**/node_modules/
+**/dist/
+**/build/
+
+# Browser extension generated artifacts
+**/_metadata/
+*.crx
+*.zip
+
+# Local/editor state
+.DS_Store
+*.swp
+*.swo
+.codex
+.env
+.env.*
+
+# Logs
+*.log

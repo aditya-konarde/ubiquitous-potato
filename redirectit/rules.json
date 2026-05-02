@@ -1,0 +1,18 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "redirect",
+      "redirect": {
+        "transform": {
+          "host": "old.reddit.com"
+        }
+      }
+    },
+    "condition": {
+      "urlFilter": "||www.reddit.com",
+      "resourceTypes": ["main_frame"]
+    }
+  }
+]

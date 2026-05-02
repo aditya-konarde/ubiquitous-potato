@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Redirectit",
+  "version": "1.0",
+  "description": "Rewrites www.reddit.com to old.reddit.com",
+  "permissions": ["declarativeNetRequest"],
+  "host_permissions": ["*://www.reddit.com/*"],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "reddit_rules",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  }
+}
