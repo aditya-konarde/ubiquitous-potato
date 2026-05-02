@@ -13,6 +13,39 @@ the mapping.
 
 ## [0.2.0] - 2026-05-02
 
+### Added — metric coverage
+
+- `amdgpu_mclk_hertz` — memory clock; reads `freq2_input` (dGPU) or parses the
+  active marker in `pp_dpm_mclk` (APU/iGPU).
+- `amdgpu_fan_rpm` — cooling fan speed; `NaN` on cards without a fan.
+- `amdgpu_pcie_link_speed_gts` / `amdgpu_pcie_link_width` — current PCIe link
+  state.
+- `amdgpu_pcie_max_link_speed_gts` / `amdgpu_pcie_max_link_width` — link
+  negotiation ceiling.
+- `amdgpu_gpu_metrics_info` — header of the kernel's `gpu_metrics` binary blob
+  (format/content revision and structure size). Field-level parsing of the
+  blob is intentionally deferred until per-version layouts are verified.
+
+### Added — exporter self-metrics
+
+- `amdgpu_exporter_build_info` (constant 1; `version` label).
+- `amdgpu_exporter_scrapes_total` (counter).
+- `amdgpu_exporter_last_scrape_duration_seconds` (gauge).
+- `amdgpu_exporter_last_scrape_succeeded` (gauge, 0 / 1).
+- `/readyz` endpoint (503 if no GPUs known or last scrape failed).
+- `/healthz` endpoint (alias for `/health`, kept for backward compat).
+
+### Added — quality
+
+- 17 unit tests covering discovery, format invariants, expected sample values,
+  NaN handling, label escaping, DPM/PCIe parsers, gpu_metrics header, and
+  exporter state.
+- Sysfs fixture tree at `tests/fixtures/sysfs_drm/` for hermetic testing.
+- GitHub Actions workflow: `cargo fmt --check`, `cargo build --release`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo test`.
+- 30-second discovery cache to avoid re-walking `/sys/class/drm` on every
+  scrape.
+
 ### Breaking — metric renames
 
 All conversions follow Prometheus base-unit conventions (seconds, bytes, hertz,
