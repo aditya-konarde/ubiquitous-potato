@@ -7,12 +7,15 @@
 use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tiny_http::{Header, Response, Server};
 
 // ─── GPU detection ─────────────────────────────────────────
 
 /// A discovered AMD GPU with its sysfs base path.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AmdGpu {
     index: u32,
     card_name: String,
@@ -23,13 +26,8 @@ struct AmdGpu {
     vbios: String,
 }
 
-/// Discover all AMD GPUs via `/sys/class/drm/card*/device/uevent`.
-fn discover_gpus() -> Vec<AmdGpu> {
-    discover_gpus_in(Path::new("/sys/class/drm"))
-}
-
-/// Discover AMD GPUs under the given DRM root directory. Useful for tests with
-/// a fixture tree.
+/// Discover AMD GPUs under the given DRM root directory. Production callers
+/// pass `/sys/class/drm`; tests pass a fixture tree.
 fn discover_gpus_in(drm: &Path) -> Vec<AmdGpu> {
     let Ok(entries) = fs::read_dir(drm) else {
         return Vec::new();
@@ -184,10 +182,16 @@ struct Sample<'a> {
     value: f64,
 }
 
-/// Write one metric family: `# HELP`, `# TYPE`, then one line per sample.
-fn write_family(out: &mut String, name: &str, help: &str, samples: &[Sample]) {
+/// Write one metric family with the given Prometheus metric type.
+fn write_family_typed(
+    out: &mut String,
+    name: &str,
+    metric_type: &str,
+    help: &str,
+    samples: &[Sample],
+) {
     let _ = writeln!(out, "# HELP {name} {help}");
-    let _ = writeln!(out, "# TYPE {name} gauge");
+    let _ = writeln!(out, "# TYPE {name} {metric_type}");
     for s in samples {
         let labels: Vec<(&str, &str)> = s.labels.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let _ = writeln!(
@@ -197,6 +201,17 @@ fn write_family(out: &mut String, name: &str, help: &str, samples: &[Sample]) {
             format_value(s.value)
         );
     }
+}
+
+/// Write a gauge metric family.
+fn write_family(out: &mut String, name: &str, help: &str, samples: &[Sample]) {
+    write_family_typed(out, name, "gauge", help, samples);
+}
+
+/// Write a counter metric family. Caller is responsible for using a `_total`
+/// suffix per Prometheus convention.
+fn write_counter(out: &mut String, name: &str, help: &str, samples: &[Sample]) {
+    write_family_typed(out, name, "counter", help, samples);
 }
 
 // ─── Per-GPU snapshot ──────────────────────────────────────
@@ -506,6 +521,109 @@ fn collect_metrics(gpus: &[AmdGpu]) -> String {
     out
 }
 
+// ─── Exporter state & self-metrics ─────────────────────────
+
+/// Process-wide state shared across HTTP handlers: discovery cache, scrape
+/// counters, last-scrape signals.
+struct ExporterState {
+    drm_root: PathBuf,
+    cache_ttl: Duration,
+    cached_gpus: Mutex<Option<(Instant, Vec<AmdGpu>)>>,
+    total_scrapes: AtomicU64,
+    last_scrape_duration_seconds: Mutex<f64>,
+    last_scrape_succeeded: AtomicBool,
+}
+
+impl ExporterState {
+    fn new(drm_root: PathBuf, cache_ttl: Duration) -> Self {
+        Self {
+            drm_root,
+            cache_ttl,
+            cached_gpus: Mutex::new(None),
+            total_scrapes: AtomicU64::new(0),
+            last_scrape_duration_seconds: Mutex::new(0.0),
+            last_scrape_succeeded: AtomicBool::new(false),
+        }
+    }
+
+    /// Get the cached GPU list, refreshing if the cache is older than `cache_ttl`.
+    fn gpus(&self) -> Vec<AmdGpu> {
+        let mut cache = self.cached_gpus.lock().unwrap();
+        if let Some((at, gpus)) = cache.as_ref()
+            && at.elapsed() < self.cache_ttl
+        {
+            return gpus.clone();
+        }
+        let gpus = discover_gpus_in(&self.drm_root);
+        *cache = Some((Instant::now(), gpus.clone()));
+        gpus
+    }
+
+    fn record_scrape(&self, duration: Duration, success: bool) {
+        self.total_scrapes.fetch_add(1, Ordering::Relaxed);
+        *self.last_scrape_duration_seconds.lock().unwrap() = duration.as_secs_f64();
+        self.last_scrape_succeeded.store(success, Ordering::Relaxed);
+    }
+
+    fn is_ready(&self) -> bool {
+        // Ready means: at least one GPU known and last scrape (if any) succeeded.
+        let has_gpus = self
+            .cached_gpus
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(_, g)| !g.is_empty());
+        let scraped_ok = self.total_scrapes.load(Ordering::Relaxed) == 0 // never scraped is OK at startup
+                || self.last_scrape_succeeded.load(Ordering::Relaxed);
+        has_gpus && scraped_ok
+    }
+}
+
+/// Emit exporter self-metrics (build info, scrape counters, etc).
+fn collect_exporter_metrics(state: &ExporterState, out: &mut String) {
+    write_family(
+        out,
+        "amdgpu_exporter_build_info",
+        "Build information about this exporter (constant 1; identity in labels).",
+        &[Sample {
+            labels: vec![("version", env!("CARGO_PKG_VERSION").to_string())],
+            value: 1.0,
+        }],
+    );
+    write_counter(
+        out,
+        "amdgpu_exporter_scrapes_total",
+        "Cumulative number of /metrics scrapes served.",
+        &[Sample {
+            labels: vec![],
+            value: state.total_scrapes.load(Ordering::Relaxed) as f64,
+        }],
+    );
+    let last_dur = *state.last_scrape_duration_seconds.lock().unwrap();
+    write_family(
+        out,
+        "amdgpu_exporter_last_scrape_duration_seconds",
+        "Wall-clock time of the most recent /metrics scrape, in seconds.",
+        &[Sample {
+            labels: vec![],
+            value: last_dur,
+        }],
+    );
+    write_family(
+        out,
+        "amdgpu_exporter_last_scrape_succeeded",
+        "1 if the most recent /metrics scrape succeeded, 0 otherwise.",
+        &[Sample {
+            labels: vec![],
+            value: if state.last_scrape_succeeded.load(Ordering::Relaxed) {
+                1.0
+            } else {
+                0.0
+            },
+        }],
+    );
+}
+
 // ─── CLI ──────────────────────────────────────────────────
 
 fn parse_args() -> (String, u16) {
@@ -574,13 +692,13 @@ fn main() {
     let (addr, port) = parse_args();
     let listen_addr = format!("{addr}:{port}");
 
-    let gpus = discover_gpus();
-    if gpus.is_empty() {
+    let state = ExporterState::new(PathBuf::from("/sys/class/drm"), Duration::from_secs(30));
+    let initial = state.gpus();
+    if initial.is_empty() {
         log::error!("No AMD GPUs found in /sys/class/drm/");
         std::process::exit(1);
     }
-
-    for gpu in &gpus {
+    for gpu in &initial {
         log::info!(
             "Found GPU {}: {} (PCI: {}, VBIOS: {})",
             gpu.index,
@@ -603,37 +721,37 @@ fn main() {
     for request in server.incoming_requests() {
         let url = request.url().to_string();
         let method = request.method().to_string();
+        let is_get_or_head = method == "GET" || method == "HEAD";
 
-        let response = match url.as_str() {
-            "/metrics" => {
-                if method != "GET" && method != "HEAD" {
-                    error_response("Method Not Allowed".to_string())
+        let response = match (url.as_str(), is_get_or_head) {
+            ("/metrics", true) => {
+                let started = Instant::now();
+                let gpus = state.gpus();
+                let mut body = collect_metrics(&gpus);
+                collect_exporter_metrics(&state, &mut body);
+                state.record_scrape(started.elapsed(), true);
+                ok_response(body, "text/plain; version=0.0.4; charset=utf-8")
+            }
+            ("/healthz" | "/health", true) => ok_response("OK".to_string(), "text/plain"),
+            ("/readyz", true) => {
+                if state.is_ready() {
+                    ok_response("READY".to_string(), "text/plain")
                 } else {
-                    // Re-discover GPUs on each scrape to handle hotplug
-                    let gpus = discover_gpus();
-                    let body = collect_metrics(&gpus);
-                    ok_response(body, "text/plain; version=0.0.4; charset=utf-8")
+                    Response::from_string("NOT READY".to_string())
+                        .with_status_code(503)
+                        .with_header(Header::from_bytes("Content-Type", "text/plain").unwrap())
                 }
             }
-            "/health" => {
-                if method != "GET" && method != "HEAD" {
-                    error_response("Method Not Allowed".to_string())
-                } else {
-                    ok_response("OK".to_string(), "text/plain")
-                }
+            ("/", true) => {
+                let body = "<h1>amdgpu-exporter</h1>\
+                    <p>Prometheus metrics exporter for AMD GPUs</p>\
+                    <p><a href=\"/metrics\">/metrics</a> | \
+                    <a href=\"/healthz\">/healthz</a> | \
+                    <a href=\"/readyz\">/readyz</a></p>"
+                    .to_string();
+                ok_response(body, "text/html; charset=utf-8")
             }
-            "/" => {
-                if method != "GET" && method != "HEAD" {
-                    error_response("Method Not Allowed".to_string())
-                } else {
-                    let body = "<h1>amdgpu-exporter</h1>\
-                        <p>Prometheus metrics exporter for AMD GPUs</p>\
-                        <p><a href=\"/metrics\">Metrics</a> | \
-                        <a href=\"/health\">Health</a></p>"
-                        .to_string();
-                    ok_response(body, "text/html; charset=utf-8")
-                }
-            }
+            (_, false) => error_response("Method Not Allowed".to_string()),
             _ => Response::from_string("Not Found".to_string())
                 .with_status_code(404)
                 .with_header(Header::from_bytes("Content-Type", "text/plain").unwrap()),
@@ -791,6 +909,71 @@ mod tests {
             body.contains(r#"amdgpu_vram_total_bytes{gpu="0"} NaN"#),
             "expected NaN for missing vram reading; got:\n{body}"
         );
+    }
+
+    #[test]
+    fn exporter_state_caches_discovery() {
+        let state = ExporterState::new(fixture_drm_root(), Duration::from_secs(60));
+        let g1 = state.gpus();
+        assert_eq!(g1.len(), 1);
+        // Second call must hit the cache (not re-walk sysfs); we observe by
+        // confirming the cache was populated.
+        let cache = state.cached_gpus.lock().unwrap();
+        assert!(
+            cache.is_some(),
+            "cache should be populated after first gpus()"
+        );
+        drop(cache);
+        let g2 = state.gpus();
+        assert_eq!(g1[0].pci_id, g2[0].pci_id);
+    }
+
+    #[test]
+    fn collect_exporter_metrics_emits_self_metrics() {
+        let state = ExporterState::new(fixture_drm_root(), Duration::from_secs(60));
+        let _ = state.gpus(); // populate cache
+        state.record_scrape(Duration::from_millis(7), true);
+        state.record_scrape(Duration::from_millis(9), true);
+
+        let mut out = String::new();
+        collect_exporter_metrics(&state, &mut out);
+
+        assert!(
+            out.contains(&format!(
+                r#"amdgpu_exporter_build_info{{version="{}"}} 1"#,
+                env!("CARGO_PKG_VERSION")
+            )),
+            "missing build_info; got:\n{out}"
+        );
+        assert!(
+            out.contains("amdgpu_exporter_scrapes_total 2"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("amdgpu_exporter_last_scrape_succeeded 1"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.lines()
+                .any(|l| l.starts_with("amdgpu_exporter_last_scrape_duration_seconds ")),
+            "missing last scrape duration sample; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn readyz_logic() {
+        let state = ExporterState::new(fixture_drm_root(), Duration::from_secs(60));
+        // Before any gpus() call: cache is None → not ready
+        assert!(!state.is_ready());
+        let _ = state.gpus();
+        // After successful discovery, before any scrape: still ready (zero-scrape grace)
+        assert!(state.is_ready());
+        // After a failed scrape: not ready
+        state.record_scrape(Duration::from_millis(1), false);
+        assert!(!state.is_ready());
+        // After a recovery: ready again
+        state.record_scrape(Duration::from_millis(1), true);
+        assert!(state.is_ready());
     }
 
     #[test]
