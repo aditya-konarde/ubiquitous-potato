@@ -167,7 +167,11 @@ fn format_value(v: f64) -> String {
     if v.is_nan() {
         "NaN".into()
     } else if v.is_infinite() {
-        if v.is_sign_positive() { "+Inf".into() } else { "-Inf".into() }
+        if v.is_sign_positive() {
+            "+Inf".into()
+        } else {
+            "-Inf".into()
+        }
     } else {
         // Use Rust's default float formatting; always finite here.
         format!("{v}")
@@ -185,9 +189,13 @@ fn write_family(out: &mut String, name: &str, help: &str, samples: &[Sample]) {
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} gauge");
     for s in samples {
-        let labels: Vec<(&str, &str)> =
-            s.labels.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let _ = writeln!(out, "{name}{} {}", format_labels(&labels), format_value(s.value));
+        let labels: Vec<(&str, &str)> = s.labels.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let _ = writeln!(
+            out,
+            "{name}{} {}",
+            format_labels(&labels),
+            format_value(s.value)
+        );
     }
 }
 
@@ -220,12 +228,22 @@ fn snapshot(gpu: &AmdGpu) -> Snapshot {
     let h = gpu.hwmon.as_ref();
     let nan = f64::NAN;
 
-    let temp_c = read_hwmon_f64(h, "temp1_input").map(|m| m / 1000.0).unwrap_or(nan);
-    let power_w = read_hwmon_f64(h, "power1_input").map(|uw| uw / 1_000_000.0).unwrap_or(nan);
-    let power_avg_w = read_hwmon_f64(h, "power1_average").map(|uw| uw / 1_000_000.0).unwrap_or(nan);
+    let temp_c = read_hwmon_f64(h, "temp1_input")
+        .map(|m| m / 1000.0)
+        .unwrap_or(nan);
+    let power_w = read_hwmon_f64(h, "power1_input")
+        .map(|uw| uw / 1_000_000.0)
+        .unwrap_or(nan);
+    let power_avg_w = read_hwmon_f64(h, "power1_average")
+        .map(|uw| uw / 1_000_000.0)
+        .unwrap_or(nan);
     let sclk_hz = read_hwmon_f64(h, "freq1_input").unwrap_or(nan);
-    let vddgfx_v = read_hwmon_f64(h, "in0_input").map(|mv| mv / 1000.0).unwrap_or(nan);
-    let vddnb_v = read_hwmon_f64(h, "in1_input").map(|mv| mv / 1000.0).unwrap_or(nan);
+    let vddgfx_v = read_hwmon_f64(h, "in0_input")
+        .map(|mv| mv / 1000.0)
+        .unwrap_or(nan);
+    let vddnb_v = read_hwmon_f64(h, "in1_input")
+        .map(|mv| mv / 1000.0)
+        .unwrap_or(nan);
 
     let gpu_util_ratio = read_sysfs_u64(&gpu.sysfs.join("gpu_busy_percent"))
         .map(|p| p as f64 / 100.0)
@@ -265,14 +283,28 @@ fn snapshot(gpu: &AmdGpu) -> Snapshot {
         read_sysfs_string(&gpu.sysfs.join("power_state")).unwrap_or_else(|| "unknown".into());
     let dpm_level = read_sysfs_string(&gpu.sysfs.join("power_dpm_force_performance_level"))
         .unwrap_or_else(|| "unknown".into());
-    let dpm_state = read_sysfs_string(&gpu.sysfs.join("power_dpm_state"))
-        .unwrap_or_else(|| "unknown".into());
+    let dpm_state =
+        read_sysfs_string(&gpu.sysfs.join("power_dpm_state")).unwrap_or_else(|| "unknown".into());
 
     Snapshot {
-        temp_c, power_w, power_avg_w, sclk_hz, gpu_util_ratio, vram_util_ratio,
-        vram_total, vram_used, vram_free, vis_vram_total, vis_vram_used,
-        gtt_total, gtt_used, vddgfx_v, vddnb_v,
-        power_state, dpm_level, dpm_state,
+        temp_c,
+        power_w,
+        power_avg_w,
+        sclk_hz,
+        gpu_util_ratio,
+        vram_util_ratio,
+        vram_total,
+        vram_used,
+        vram_free,
+        vis_vram_total,
+        vis_vram_used,
+        gtt_total,
+        gtt_used,
+        vddgfx_v,
+        vddnb_v,
+        power_state,
+        dpm_level,
+        dpm_state,
     }
 }
 
@@ -303,7 +335,10 @@ fn collect_metrics(gpus: &[AmdGpu]) -> String {
         &mut out,
         "amdgpu_count",
         "Number of AMD GPUs detected.",
-        &[Sample { labels: vec![], value: gpus.len() as f64 }],
+        &[Sample {
+            labels: vec![],
+            value: gpus.len() as f64,
+        }],
     );
 
     // Identity (info-style: value=1, identity in labels).
@@ -320,67 +355,123 @@ fn collect_metrics(gpus: &[AmdGpu]) -> String {
             value: 1.0,
         })
         .collect();
-    write_family(&mut out, "amdgpu_info", "AMD GPU identity (constant 1; identity in labels).", &info);
+    write_family(
+        &mut out,
+        "amdgpu_info",
+        "AMD GPU identity (constant 1; identity in labels).",
+        &info,
+    );
 
     // Numeric series.
-    write_family(&mut out, "amdgpu_temperature_celsius",
+    write_family(
+        &mut out,
+        "amdgpu_temperature_celsius",
         "GPU edge temperature in degrees Celsius.",
-        &series(gpus, &snaps, |s| s.temp_c));
-    write_family(&mut out, "amdgpu_power_draw_watts",
+        &series(gpus, &snaps, |s| s.temp_c),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_power_draw_watts",
         "GPU instantaneous power draw in watts.",
-        &series(gpus, &snaps, |s| s.power_w));
-    write_family(&mut out, "amdgpu_power_average_watts",
+        &series(gpus, &snaps, |s| s.power_w),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_power_average_watts",
         "GPU average power draw in watts.",
-        &series(gpus, &snaps, |s| s.power_avg_w));
-    write_family(&mut out, "amdgpu_sclk_hertz",
+        &series(gpus, &snaps, |s| s.power_avg_w),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_sclk_hertz",
         "GPU shader (graphics) clock frequency in hertz.",
-        &series(gpus, &snaps, |s| s.sclk_hz));
-    write_family(&mut out, "amdgpu_gpu_utilization_ratio",
+        &series(gpus, &snaps, |s| s.sclk_hz),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_gpu_utilization_ratio",
         "GPU utilization as a ratio in [0, 1].",
-        &series(gpus, &snaps, |s| s.gpu_util_ratio));
-    write_family(&mut out, "amdgpu_vram_utilization_ratio",
+        &series(gpus, &snaps, |s| s.gpu_util_ratio),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_vram_utilization_ratio",
         "VRAM utilization as a ratio in [0, 1].",
-        &series(gpus, &snaps, |s| s.vram_util_ratio));
-    write_family(&mut out, "amdgpu_vram_total_bytes",
+        &series(gpus, &snaps, |s| s.vram_util_ratio),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_vram_total_bytes",
         "GPU VRAM total in bytes.",
-        &series(gpus, &snaps, |s| s.vram_total));
-    write_family(&mut out, "amdgpu_vram_used_bytes",
+        &series(gpus, &snaps, |s| s.vram_total),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_vram_used_bytes",
         "GPU VRAM used in bytes.",
-        &series(gpus, &snaps, |s| s.vram_used));
-    write_family(&mut out, "amdgpu_vram_free_bytes",
+        &series(gpus, &snaps, |s| s.vram_used),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_vram_free_bytes",
         "GPU VRAM free in bytes.",
-        &series(gpus, &snaps, |s| s.vram_free));
-    write_family(&mut out, "amdgpu_vis_vram_total_bytes",
+        &series(gpus, &snaps, |s| s.vram_free),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_vis_vram_total_bytes",
         "Visible (CPU-mappable) VRAM total in bytes.",
-        &series(gpus, &snaps, |s| s.vis_vram_total));
-    write_family(&mut out, "amdgpu_vis_vram_used_bytes",
+        &series(gpus, &snaps, |s| s.vis_vram_total),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_vis_vram_used_bytes",
         "Visible (CPU-mappable) VRAM used in bytes.",
-        &series(gpus, &snaps, |s| s.vis_vram_used));
-    write_family(&mut out, "amdgpu_gtt_total_bytes",
+        &series(gpus, &snaps, |s| s.vis_vram_used),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_gtt_total_bytes",
         "GTT (system-to-GPU) memory total in bytes.",
-        &series(gpus, &snaps, |s| s.gtt_total));
-    write_family(&mut out, "amdgpu_gtt_used_bytes",
+        &series(gpus, &snaps, |s| s.gtt_total),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_gtt_used_bytes",
         "GTT (system-to-GPU) memory used in bytes.",
-        &series(gpus, &snaps, |s| s.gtt_used));
-    write_family(&mut out, "amdgpu_vddgfx_volts",
+        &series(gpus, &snaps, |s| s.gtt_used),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_vddgfx_volts",
         "GPU core voltage (VDDGFX) in volts.",
-        &series(gpus, &snaps, |s| s.vddgfx_v));
-    write_family(&mut out, "amdgpu_vddnb_volts",
+        &series(gpus, &snaps, |s| s.vddgfx_v),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_vddnb_volts",
         "Northbridge voltage (VDDNB) in volts.",
-        &series(gpus, &snaps, |s| s.vddnb_v));
+        &series(gpus, &snaps, |s| s.vddnb_v),
+    );
 
     // Info-style state metrics: value=1, label encodes current state.
     let power_state_samples: Vec<Sample> = gpus
         .iter()
         .zip(snaps.iter())
         .map(|(g, s)| Sample {
-            labels: vec![("gpu", g.index.to_string()), ("state", s.power_state.clone())],
+            labels: vec![
+                ("gpu", g.index.to_string()),
+                ("state", s.power_state.clone()),
+            ],
             value: 1.0,
         })
         .collect();
-    write_family(&mut out, "amdgpu_power_state_info",
+    write_family(
+        &mut out,
+        "amdgpu_power_state_info",
         "GPU ACPI power state (D0/D1/D2/D3hot/D3cold). Value is constant 1; current state in label.",
-        &power_state_samples);
+        &power_state_samples,
+    );
 
     let dpm_level_samples: Vec<Sample> = gpus
         .iter()
@@ -390,9 +481,12 @@ fn collect_metrics(gpus: &[AmdGpu]) -> String {
             value: 1.0,
         })
         .collect();
-    write_family(&mut out, "amdgpu_dpm_performance_level_info",
+    write_family(
+        &mut out,
+        "amdgpu_dpm_performance_level_info",
         "DPM performance level (auto/low/high/manual/etc). Value is constant 1; current level in label.",
-        &dpm_level_samples);
+        &dpm_level_samples,
+    );
 
     let dpm_state_samples: Vec<Sample> = gpus
         .iter()
@@ -402,9 +496,12 @@ fn collect_metrics(gpus: &[AmdGpu]) -> String {
             value: 1.0,
         })
         .collect();
-    write_family(&mut out, "amdgpu_dpm_state_info",
+    write_family(
+        &mut out,
+        "amdgpu_dpm_state_info",
         "DPM power state (battery/balanced/performance). Value is constant 1; current state in label.",
-        &dpm_state_samples);
+        &dpm_state_samples,
+    );
 
     out
 }
@@ -599,10 +696,16 @@ mod tests {
             }
         }
         for (name, count) in &help_count {
-            assert_eq!(*count, 1, "HELP for {name} should appear once, found {count}");
+            assert_eq!(
+                *count, 1,
+                "HELP for {name} should appear once, found {count}"
+            );
         }
         for (name, count) in &type_count {
-            assert_eq!(*count, 1, "TYPE for {name} should appear once, found {count}");
+            assert_eq!(
+                *count, 1,
+                "TYPE for {name} should appear once, found {count}"
+            );
         }
         assert_eq!(
             help_count.keys().collect::<std::collections::HashSet<_>>(),
@@ -627,7 +730,9 @@ mod tests {
             // Head: metric name, optionally followed by {labels}.
             let metric_name = head.split('{').next().unwrap();
             assert!(
-                metric_name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                metric_name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
                 "metric name must be lowercase snake_case: {metric_name:?}"
             );
         }
@@ -646,7 +751,9 @@ mod tests {
         };
 
         has("amdgpu_count 1");
-        has(r#"amdgpu_info{gpu="0",pci_id="1002:1586",device="AMD GPU [0x1586]",vbios="TEST-VBIOS-1",card="card0"} 1"#);
+        has(
+            r#"amdgpu_info{gpu="0",pci_id="1002:1586",device="AMD GPU [0x1586]",vbios="TEST-VBIOS-1",card="card0"} 1"#,
+        );
         has(r#"amdgpu_temperature_celsius{gpu="0"} 65"#);
         has(r#"amdgpu_power_draw_watts{gpu="0"} 25"#);
         has(r#"amdgpu_power_average_watts{gpu="0"} 24"#);

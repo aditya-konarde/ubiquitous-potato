@@ -1,0 +1,48 @@
+name: amdgpu-exporter CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'amdgpu-exporter/**'
+      - '.github/workflows/amdgpu-exporter.yml'
+  pull_request:
+    paths:
+      - 'amdgpu-exporter/**'
+      - '.github/workflows/amdgpu-exporter.yml'
+
+defaults:
+  run:
+    working-directory: amdgpu-exporter
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            amdgpu-exporter/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('amdgpu-exporter/Cargo.lock') }}
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --release --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
