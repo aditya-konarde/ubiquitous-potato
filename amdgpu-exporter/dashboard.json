@@ -58,7 +58,7 @@
       },
       "targets": [
         {
-          "expr": "amdgpu_gpu_utilization_percent",
+          "expr": "amdgpu_gpu_utilization_ratio * 100",
           "legendFormat": "GPU {{gpu}}",
           "refId": "A"
         }
@@ -86,7 +86,7 @@
       },
       "targets": [
         {
-          "expr": "amdgpu_vram_utilization_percent",
+          "expr": "amdgpu_vram_utilization_ratio * 100",
           "legendFormat": "GPU {{gpu}}",
           "refId": "A"
         }
@@ -187,12 +187,12 @@
       },
       "targets": [
         {
-          "expr": "amdgpu_gpu_utilization_percent",
+          "expr": "amdgpu_gpu_utilization_ratio * 100",
           "legendFormat": "GPU {{gpu}} Compute",
           "refId": "A"
         },
         {
-          "expr": "amdgpu_vram_utilization_percent",
+          "expr": "amdgpu_vram_utilization_ratio * 100",
           "legendFormat": "GPU {{gpu}} VRAM",
           "refId": "B"
         }
@@ -214,7 +214,7 @@
       },
       "targets": [
         {
-          "expr": "amdgpu_sclk_mhz",
+          "expr": "amdgpu_sclk_hertz / 1000000",
           "legendFormat": "GPU {{gpu}}",
           "refId": "A"
         }

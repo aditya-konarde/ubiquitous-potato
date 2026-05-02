@@ -63,32 +63,41 @@ cargo build --release
 | `/health` | Returns `OK` |
 | `/` | Info page with links |
 
-## 📊 Metrics (22 total)
+## 📊 Metrics (16 numeric gauges + 4 info metrics)
 
-All metrics carry a `gpu` label with the card index.
+All metric names use Prometheus base units (seconds, bytes, hertz, volts, ratio).
+Per-GPU metrics carry a `gpu` label with the card index. Readings missing from
+sysfs are emitted as `NaN`.
+
+### Numeric series (gauges)
 
 | Metric | Labels | Description |
 |--------|--------|-------------|
-| `amdgpu_count` | — | Number of GPUs |
-| `amdgpu_info` | `gpu`, `pci_id`, `device`, `vbios`, `card` | GPU identity (value=1) |
+| `amdgpu_count` | — | Number of detected AMD GPUs |
 | `amdgpu_temperature_celsius` | `gpu` | Edge temperature (°C) |
-| `amdgpu_power_draw_watts` | `gpu` | Instantaneous power (W) |
-| `amdgpu_power_average_watts` | `gpu` | Average power (W) |
-| `amdgpu_sclk_mhz` | `gpu` | Shader clock (MHz) |
-| `amdgpu_gpu_utilization_percent` | `gpu` | GPU utilization (%) |
-| `amdgpu_vram_utilization_percent` | `gpu` | VRAM utilization (%) |
-| `amdgpu_vram_total_bytes` | `gpu` | Total VRAM (bytes) |
-| `amdgpu_vram_used_bytes` | `gpu` | Used VRAM (bytes) |
-| `amdgpu_vram_free_bytes` | `gpu` | Free VRAM (bytes) |
-| `amdgpu_vis_vram_total_bytes` | `gpu` | Visible VRAM total (bytes) |
+| `amdgpu_power_draw_watts` | `gpu` | Instantaneous power draw (W) |
+| `amdgpu_power_average_watts` | `gpu` | Average power draw (W) |
+| `amdgpu_sclk_hertz` | `gpu` | Shader (graphics) clock frequency (Hz) |
+| `amdgpu_gpu_utilization_ratio` | `gpu` | GPU utilization, ratio in [0, 1] |
+| `amdgpu_vram_utilization_ratio` | `gpu` | VRAM utilization, ratio in [0, 1] |
+| `amdgpu_vram_total_bytes` | `gpu` | VRAM total (bytes) |
+| `amdgpu_vram_used_bytes` | `gpu` | VRAM used (bytes) |
+| `amdgpu_vram_free_bytes` | `gpu` | VRAM free (bytes) |
+| `amdgpu_vis_vram_total_bytes` | `gpu` | Visible (CPU-mappable) VRAM total (bytes) |
 | `amdgpu_vis_vram_used_bytes` | `gpu` | Visible VRAM used (bytes) |
-| `amdgpu_gtt_total_bytes` | `gpu` | GTT memory total (bytes) |
+| `amdgpu_gtt_total_bytes` | `gpu` | GTT (system-to-GPU) memory total (bytes) |
 | `amdgpu_gtt_used_bytes` | `gpu` | GTT memory used (bytes) |
-| `amdgpu_vddgfx_mv` | `gpu` | GPU core voltage (mV) |
-| `amdgpu_vddnb_mv` | `gpu` | Northbridge voltage (mV) |
-| `amdgpu_power_state` | `gpu`, `state` | ACPI power state |
-| `amdgpu_dpm_performance_level` | `gpu`, `level` | DPM performance level |
-| `amdgpu_dpm_state` | `gpu`, `state` | DPM power state |
+| `amdgpu_vddgfx_volts` | `gpu` | GPU core voltage VDDGFX (V) |
+| `amdgpu_vddnb_volts` | `gpu` | Northbridge voltage VDDNB (V) |
+
+### Info metrics (constant 1; current state in label)
+
+| Metric | Labels | Description |
+|--------|--------|-------------|
+| `amdgpu_info` | `gpu`, `pci_id`, `device`, `vbios`, `card` | GPU identity |
+| `amdgpu_power_state_info` | `gpu`, `state` | ACPI power state (D0/D1/D2/D3hot/D3cold) |
+| `amdgpu_dpm_performance_level_info` | `gpu`, `level` | DPM performance level |
+| `amdgpu_dpm_state_info` | `gpu`, `state` | DPM power state |
 
 ## 📈 Grafana Dashboard
 

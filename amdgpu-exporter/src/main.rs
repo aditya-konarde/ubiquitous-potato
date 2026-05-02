@@ -17,7 +17,7 @@ struct AmdGpu {
     index: u32,
     card_name: String,
     sysfs: PathBuf,
-    hwmon: PathBuf,
+    hwmon: Option<PathBuf>,
     pci_id: String,
     device_name: String,
     vbios: String,
@@ -65,15 +65,11 @@ fn discover_gpus() -> Vec<AmdGpu> {
             .map(|l| l.trim_start_matches("PCI_ID=").to_string())
             .unwrap_or_else(|| "unknown".into());
 
-        // Find hwmon
-        let hwmon_dir = device_dir.join("hwmon");
-        let hwmon = fs::read_dir(&hwmon_dir)
+        // Find hwmon directory (None if absent or unreadable)
+        let hwmon = fs::read_dir(device_dir.join("hwmon"))
             .ok()
-            .and_then(|mut rd| rd.next())
-            .map(|e| e.ok().unwrap().path())
-            .unwrap_or_else(|| hwmon_dir.join("hwmon0"));
+            .and_then(|mut rd| rd.find_map(|e| e.ok().map(|e| e.path())));
 
-        // Read device name from PCI (best effort)
         let device_name = read_device_name(&device_dir);
         let vbios = read_sysfs_string(&device_dir.join("vbios_version"))
             .unwrap_or_else(|| "unknown".into());
@@ -121,14 +117,19 @@ fn read_sysfs_u64(path: &Path) -> Option<u64> {
     read_sysfs_string(path).and_then(|s| s.parse().ok())
 }
 
-/// Read a sysfs file as f64 (supports millidegrees, microwatts, etc.).
+/// Read a sysfs file as f64.
 fn read_sysfs_f64(path: &Path) -> Option<f64> {
     read_sysfs_string(path).and_then(|s| s.parse().ok())
 }
 
-// ─── Metric collection ─────────────────────────────────────
+/// Read a hwmon-relative sysfs file as f64, returning None if hwmon is absent.
+fn read_hwmon_f64(hwmon: Option<&PathBuf>, file: &str) -> Option<f64> {
+    hwmon.and_then(|h| read_sysfs_f64(&h.join(file)))
+}
 
-/// Escape a Prometheus label value according to the text exposition format.
+// ─── Metric emission ───────────────────────────────────────
+
+/// Escape a Prometheus label value per the text exposition format.
 fn escape_prom_label_value(value: &str) -> String {
     value
         .replace('\\', r"\\")
@@ -136,270 +137,269 @@ fn escape_prom_label_value(value: &str) -> String {
         .replace('"', r#"\""#)
 }
 
-/// Write a Prometheus gauge metric.
-macro_rules! gauge {
-    ($out:expr, $name:expr, $value:expr, $help:expr) => {
-        let _ = write!(
-            $out,
-            "# HELP {} {}\n# TYPE {} gauge\n{} {}\n",
-            $name, $help, $name, $name, $value
-        );
+/// Format a label set as `{k1="v1",k2="v2"}` (or empty string if no labels).
+fn format_labels(labels: &[(&str, &str)]) -> String {
+    if labels.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(64);
+    out.push('{');
+    for (i, (k, v)) in labels.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(k);
+        out.push_str("=\"");
+        out.push_str(&escape_prom_label_value(v));
+        out.push('"');
+    }
+    out.push('}');
+    out
+}
+
+/// Format a Prometheus float value: NaN, +Inf, -Inf, or finite.
+fn format_value(v: f64) -> String {
+    if v.is_nan() {
+        "NaN".into()
+    } else if v.is_infinite() {
+        if v.is_sign_positive() { "+Inf".into() } else { "-Inf".into() }
+    } else {
+        // Use Rust's default float formatting; always finite here.
+        format!("{v}")
+    }
+}
+
+/// A sample within a metric family: labels + value.
+struct Sample<'a> {
+    labels: Vec<(&'a str, String)>,
+    value: f64,
+}
+
+/// Write one metric family: `# HELP`, `# TYPE`, then one line per sample.
+fn write_family(out: &mut String, name: &str, help: &str, samples: &[Sample]) {
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} gauge");
+    for s in samples {
+        let labels: Vec<(&str, &str)> =
+            s.labels.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let _ = writeln!(out, "{name}{} {}", format_labels(&labels), format_value(s.value));
+    }
+}
+
+// ─── Per-GPU snapshot ──────────────────────────────────────
+
+/// One scrape's worth of telemetry for a single GPU. Missing readings → NaN
+/// (Prometheus convention for "unknown / not applicable").
+struct Snapshot {
+    temp_c: f64,
+    power_w: f64,
+    power_avg_w: f64,
+    sclk_hz: f64,
+    gpu_util_ratio: f64,
+    vram_util_ratio: f64,
+    vram_total: f64,
+    vram_used: f64,
+    vram_free: f64,
+    vis_vram_total: f64,
+    vis_vram_used: f64,
+    gtt_total: f64,
+    gtt_used: f64,
+    vddgfx_v: f64,
+    vddnb_v: f64,
+    power_state: String,
+    dpm_level: String,
+    dpm_state: String,
+}
+
+fn snapshot(gpu: &AmdGpu) -> Snapshot {
+    let h = gpu.hwmon.as_ref();
+    let nan = f64::NAN;
+
+    let temp_c = read_hwmon_f64(h, "temp1_input").map(|m| m / 1000.0).unwrap_or(nan);
+    let power_w = read_hwmon_f64(h, "power1_input").map(|uw| uw / 1_000_000.0).unwrap_or(nan);
+    let power_avg_w = read_hwmon_f64(h, "power1_average").map(|uw| uw / 1_000_000.0).unwrap_or(nan);
+    let sclk_hz = read_hwmon_f64(h, "freq1_input").unwrap_or(nan);
+    let vddgfx_v = read_hwmon_f64(h, "in0_input").map(|mv| mv / 1000.0).unwrap_or(nan);
+    let vddnb_v = read_hwmon_f64(h, "in1_input").map(|mv| mv / 1000.0).unwrap_or(nan);
+
+    let gpu_util_ratio = read_sysfs_u64(&gpu.sysfs.join("gpu_busy_percent"))
+        .map(|p| p as f64 / 100.0)
+        .unwrap_or(nan);
+
+    let vram_total = read_sysfs_u64(&gpu.sysfs.join("mem_info_vram_total"))
+        .map(|v| v as f64)
+        .unwrap_or(nan);
+    let vram_used = read_sysfs_u64(&gpu.sysfs.join("mem_info_vram_used"))
+        .map(|v| v as f64)
+        .unwrap_or(nan);
+    let vram_free = if vram_total.is_finite() && vram_used.is_finite() {
+        (vram_total - vram_used).max(0.0)
+    } else {
+        nan
     };
-    ($out:expr, $name:expr, $value:expr, $help:expr, $($key:ident = $val:expr),* $(,)?) => {{
-        let mut labels = String::with_capacity(64);
-        $(
-            if !labels.is_empty() {
-                labels.push(',');
-            }
-            labels.push_str(concat!(stringify!($key), "=\""));
-            let value = $val.to_string();
-            labels.push_str(&escape_prom_label_value(&value));
-            labels.push('"');
-        )*
-        let _ = write!(
-            $out,
-            "# HELP {} {}\n# TYPE {} gauge\n{}{{{}}} {}\n",
-            $name, $help, $name, $name, labels, $value
-        );
-    }};
+    let vram_util_ratio = if vram_total.is_finite() && vram_total > 0.0 && vram_used.is_finite() {
+        vram_used / vram_total
+    } else {
+        nan
+    };
+
+    let vis_vram_total = read_sysfs_u64(&gpu.sysfs.join("mem_info_vis_vram_total"))
+        .map(|v| v as f64)
+        .unwrap_or(nan);
+    let vis_vram_used = read_sysfs_u64(&gpu.sysfs.join("mem_info_vis_vram_used"))
+        .map(|v| v as f64)
+        .unwrap_or(nan);
+    let gtt_total = read_sysfs_u64(&gpu.sysfs.join("mem_info_gtt_total"))
+        .map(|v| v as f64)
+        .unwrap_or(nan);
+    let gtt_used = read_sysfs_u64(&gpu.sysfs.join("mem_info_gtt_used"))
+        .map(|v| v as f64)
+        .unwrap_or(nan);
+
+    let power_state =
+        read_sysfs_string(&gpu.sysfs.join("power_state")).unwrap_or_else(|| "unknown".into());
+    let dpm_level = read_sysfs_string(&gpu.sysfs.join("power_dpm_force_performance_level"))
+        .unwrap_or_else(|| "unknown".into());
+    let dpm_state = read_sysfs_string(&gpu.sysfs.join("power_dpm_state"))
+        .unwrap_or_else(|| "unknown".into());
+
+    Snapshot {
+        temp_c, power_w, power_avg_w, sclk_hz, gpu_util_ratio, vram_util_ratio,
+        vram_total, vram_used, vram_free, vis_vram_total, vis_vram_used,
+        gtt_total, gtt_used, vddgfx_v, vddnb_v,
+        power_state, dpm_level, dpm_state,
+    }
+}
+
+// ─── Metric collection ─────────────────────────────────────
+
+/// Helper: build the per-GPU `gpu="N"` label sample list for a numeric series.
+fn series<'a, F: Fn(&Snapshot) -> f64>(
+    gpus: &'a [AmdGpu],
+    snaps: &[Snapshot],
+    f: F,
+) -> Vec<Sample<'a>> {
+    gpus.iter()
+        .zip(snaps.iter())
+        .map(|(g, s)| Sample {
+            labels: vec![("gpu", g.index.to_string())],
+            value: f(s),
+        })
+        .collect()
 }
 
 /// Collect all GPU metrics into a Prometheus text-format string.
 fn collect_metrics(gpus: &[AmdGpu]) -> String {
     let mut out = String::with_capacity(4096);
+    let snaps: Vec<Snapshot> = gpus.iter().map(snapshot).collect();
 
-    write!(
-        out,
-        "# HELP amdgpu_count Number of AMD GPUs detected.\n# TYPE amdgpu_count gauge\namdgpu_count {}\n\n",
-        gpus.len()
-    )
-    .ok();
+    // Count of detected GPUs.
+    write_family(
+        &mut out,
+        "amdgpu_count",
+        "Number of AMD GPUs detected.",
+        &[Sample { labels: vec![], value: gpus.len() as f64 }],
+    );
 
-    for gpu in gpus {
-        let i = gpu.index;
+    // Identity (info-style: value=1, identity in labels).
+    let info: Vec<Sample> = gpus
+        .iter()
+        .map(|g| Sample {
+            labels: vec![
+                ("gpu", g.index.to_string()),
+                ("pci_id", g.pci_id.clone()),
+                ("device", g.device_name.clone()),
+                ("vbios", g.vbios.clone()),
+                ("card", g.card_name.clone()),
+            ],
+            value: 1.0,
+        })
+        .collect();
+    write_family(&mut out, "amdgpu_info", "AMD GPU identity (constant 1; identity in labels).", &info);
 
-        // ─── Temperature (hwmon temp1_input is in millidegrees) ───
-        let temp_c = read_sysfs_f64(&gpu.hwmon.join("temp1_input"))
-            .map(|m| m / 1000.0)
-            .unwrap_or(0.0);
+    // Numeric series.
+    write_family(&mut out, "amdgpu_temperature_celsius",
+        "GPU edge temperature in degrees Celsius.",
+        &series(gpus, &snaps, |s| s.temp_c));
+    write_family(&mut out, "amdgpu_power_draw_watts",
+        "GPU instantaneous power draw in watts.",
+        &series(gpus, &snaps, |s| s.power_w));
+    write_family(&mut out, "amdgpu_power_average_watts",
+        "GPU average power draw in watts.",
+        &series(gpus, &snaps, |s| s.power_avg_w));
+    write_family(&mut out, "amdgpu_sclk_hertz",
+        "GPU shader (graphics) clock frequency in hertz.",
+        &series(gpus, &snaps, |s| s.sclk_hz));
+    write_family(&mut out, "amdgpu_gpu_utilization_ratio",
+        "GPU utilization as a ratio in [0, 1].",
+        &series(gpus, &snaps, |s| s.gpu_util_ratio));
+    write_family(&mut out, "amdgpu_vram_utilization_ratio",
+        "VRAM utilization as a ratio in [0, 1].",
+        &series(gpus, &snaps, |s| s.vram_util_ratio));
+    write_family(&mut out, "amdgpu_vram_total_bytes",
+        "GPU VRAM total in bytes.",
+        &series(gpus, &snaps, |s| s.vram_total));
+    write_family(&mut out, "amdgpu_vram_used_bytes",
+        "GPU VRAM used in bytes.",
+        &series(gpus, &snaps, |s| s.vram_used));
+    write_family(&mut out, "amdgpu_vram_free_bytes",
+        "GPU VRAM free in bytes.",
+        &series(gpus, &snaps, |s| s.vram_free));
+    write_family(&mut out, "amdgpu_vis_vram_total_bytes",
+        "Visible (CPU-mappable) VRAM total in bytes.",
+        &series(gpus, &snaps, |s| s.vis_vram_total));
+    write_family(&mut out, "amdgpu_vis_vram_used_bytes",
+        "Visible (CPU-mappable) VRAM used in bytes.",
+        &series(gpus, &snaps, |s| s.vis_vram_used));
+    write_family(&mut out, "amdgpu_gtt_total_bytes",
+        "GTT (system-to-GPU) memory total in bytes.",
+        &series(gpus, &snaps, |s| s.gtt_total));
+    write_family(&mut out, "amdgpu_gtt_used_bytes",
+        "GTT (system-to-GPU) memory used in bytes.",
+        &series(gpus, &snaps, |s| s.gtt_used));
+    write_family(&mut out, "amdgpu_vddgfx_volts",
+        "GPU core voltage (VDDGFX) in volts.",
+        &series(gpus, &snaps, |s| s.vddgfx_v));
+    write_family(&mut out, "amdgpu_vddnb_volts",
+        "Northbridge voltage (VDDNB) in volts.",
+        &series(gpus, &snaps, |s| s.vddnb_v));
 
-        // ─── Power (hwmon power1_input is in microwatts) ───
-        let power_w = read_sysfs_f64(&gpu.hwmon.join("power1_input"))
-            .map(|uw| uw / 1_000_000.0)
-            .unwrap_or(0.0);
+    // Info-style state metrics: value=1, label encodes current state.
+    let power_state_samples: Vec<Sample> = gpus
+        .iter()
+        .zip(snaps.iter())
+        .map(|(g, s)| Sample {
+            labels: vec![("gpu", g.index.to_string()), ("state", s.power_state.clone())],
+            value: 1.0,
+        })
+        .collect();
+    write_family(&mut out, "amdgpu_power_state_info",
+        "GPU ACPI power state (D0/D1/D2/D3hot/D3cold). Value is constant 1; current state in label.",
+        &power_state_samples);
 
-        // ─── Average power ───
-        let power_avg_w = read_sysfs_f64(&gpu.hwmon.join("power1_average"))
-            .map(|uw| uw / 1_000_000.0)
-            .unwrap_or(0.0);
+    let dpm_level_samples: Vec<Sample> = gpus
+        .iter()
+        .zip(snaps.iter())
+        .map(|(g, s)| Sample {
+            labels: vec![("gpu", g.index.to_string()), ("level", s.dpm_level.clone())],
+            value: 1.0,
+        })
+        .collect();
+    write_family(&mut out, "amdgpu_dpm_performance_level_info",
+        "DPM performance level (auto/low/high/manual/etc). Value is constant 1; current level in label.",
+        &dpm_level_samples);
 
-        // ─── Clock frequencies ───
-        // sclk from hwmon freq1_input (Hz)
-        let sclk_mhz = read_sysfs_f64(&gpu.hwmon.join("freq1_input"))
-            .map(|hz| hz / 1_000_000.0)
-            .unwrap_or(0.0);
-
-        // GPU busy percent
-        let gpu_util = read_sysfs_u64(&gpu.sysfs.join("gpu_busy_percent")).unwrap_or(0);
-
-        // ─── Memory ───
-        let vram_total = read_sysfs_u64(&gpu.sysfs.join("mem_info_vram_total")).unwrap_or(0);
-        let vram_used = read_sysfs_u64(&gpu.sysfs.join("mem_info_vram_used")).unwrap_or(0);
-        let vram_free = vram_total.saturating_sub(vram_used);
-        let vis_vram_total =
-            read_sysfs_u64(&gpu.sysfs.join("mem_info_vis_vram_total")).unwrap_or(0);
-        let vis_vram_used = read_sysfs_u64(&gpu.sysfs.join("mem_info_vis_vram_used")).unwrap_or(0);
-        let gtt_total = read_sysfs_u64(&gpu.sysfs.join("mem_info_gtt_total")).unwrap_or(0);
-        let gtt_used = read_sysfs_u64(&gpu.sysfs.join("mem_info_gtt_used")).unwrap_or(0);
-
-        // ─── Voltage ───
-        let vddgfx = read_sysfs_f64(&gpu.hwmon.join("in0_input")).unwrap_or(0.0);
-        let vddnb = read_sysfs_f64(&gpu.hwmon.join("in1_input")).unwrap_or(0.0);
-
-        // ─── Power state / DPM ───
-        let power_state =
-            read_sysfs_string(&gpu.sysfs.join("power_state")).unwrap_or_else(|| "unknown".into());
-        let dpm_level = read_sysfs_string(&gpu.sysfs.join("power_dpm_force_performance_level"))
-            .unwrap_or_else(|| "unknown".into());
-        let dpm_state = read_sysfs_string(&gpu.sysfs.join("power_dpm_state"))
-            .unwrap_or_else(|| "unknown".into());
-
-        // DPM level as info metric
-        gauge!(
-            &mut out,
-            "amdgpu_dpm_performance_level",
-            1,
-            "DPM performance level setting",
-            gpu = i,
-            level = &dpm_level
-        );
-        gauge!(
-            &mut out,
-            "amdgpu_dpm_state",
-            1,
-            "DPM power state",
-            gpu = i,
-            state = &dpm_state
-        );
-
-        // VRAM usage percent
-        let vram_util_pct = if vram_total > 0 {
-            (vram_used as f64 / vram_total as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        // ─── Emit metrics ───
-        // Identity
-        gauge!(
-            &mut out,
-            "amdgpu_info",
-            1,
-            "AMD GPU information (value=1 for each GPU)",
-            gpu = i,
-            pci_id = &gpu.pci_id,
-            device = &gpu.device_name,
-            vbios = &gpu.vbios,
-            card = &gpu.card_name
-        );
-
-        // Temperature
-        gauge!(
-            &mut out,
-            "amdgpu_temperature_celsius",
-            temp_c,
-            "GPU edge temperature in Celsius",
-            gpu = i
-        );
-
-        // Power
-        gauge!(
-            &mut out,
-            "amdgpu_power_draw_watts",
-            power_w,
-            "GPU instantaneous power draw in watts",
-            gpu = i
-        );
-        gauge!(
-            &mut out,
-            "amdgpu_power_average_watts",
-            power_avg_w,
-            "GPU average power draw in watts",
-            gpu = i
-        );
-
-        // Clocks
-        gauge!(
-            &mut out,
-            "amdgpu_sclk_mhz",
-            sclk_mhz,
-            "GPU shader clock in MHz",
-            gpu = i
-        );
-
-        // Utilization
-        gauge!(
-            &mut out,
-            "amdgpu_gpu_utilization_percent",
-            gpu_util,
-            "GPU utilization in percent",
-            gpu = i
-        );
-        gauge!(
-            &mut out,
-            "amdgpu_vram_utilization_percent",
-            vram_util_pct,
-            "VRAM utilization in percent",
-            gpu = i
-        );
-
-        // Memory
-        gauge!(
-            &mut out,
-            "amdgpu_vram_total_bytes",
-            vram_total,
-            "GPU VRAM total in bytes",
-            gpu = i
-        );
-        gauge!(
-            &mut out,
-            "amdgpu_vram_used_bytes",
-            vram_used,
-            "GPU VRAM used in bytes",
-            gpu = i
-        );
-        gauge!(
-            &mut out,
-            "amdgpu_vram_free_bytes",
-            vram_free,
-            "GPU VRAM free in bytes",
-            gpu = i
-        );
-        gauge!(
-            &mut out,
-            "amdgpu_vis_vram_total_bytes",
-            vis_vram_total,
-            "Visible VRAM total in bytes",
-            gpu = i
-        );
-        gauge!(
-            &mut out,
-            "amdgpu_vis_vram_used_bytes",
-            vis_vram_used,
-            "Visible VRAM used in bytes",
-            gpu = i
-        );
-        gauge!(
-            &mut out,
-            "amdgpu_gtt_total_bytes",
-            gtt_total,
-            "GTT (system-to-GPU) memory total in bytes",
-            gpu = i
-        );
-        gauge!(
-            &mut out,
-            "amdgpu_gtt_used_bytes",
-            gtt_used,
-            "GTT (system-to-GPU) memory used in bytes",
-            gpu = i
-        );
-
-        // Voltage
-        gauge!(
-            &mut out,
-            "amdgpu_vddgfx_mv",
-            vddgfx,
-            "GPU core voltage in mV",
-            gpu = i
-        );
-        gauge!(
-            &mut out,
-            "amdgpu_vddnb_mv",
-            vddnb,
-            "Northbridge voltage in mV",
-            gpu = i
-        );
-
-        // Power state (info metric — value encodes state)
-        let ps_val = match power_state.as_str() {
-            "D0" => 0,
-            "D1" => 1,
-            "D2" => 2,
-            "D3hot" => 3,
-            "D3cold" => 4,
-            _ => -1,
-        };
-        gauge!(
-            &mut out,
-            "amdgpu_power_state",
-            ps_val,
-            "GPU power state (D0=0, D1=1, D2=2, D3hot=3, D3cold=4)",
-            gpu = i,
-            state = &power_state
-        );
-
-        out.push('\n');
-    }
+    let dpm_state_samples: Vec<Sample> = gpus
+        .iter()
+        .zip(snaps.iter())
+        .map(|(g, s)| Sample {
+            labels: vec![("gpu", g.index.to_string()), ("state", s.dpm_state.clone())],
+            value: 1.0,
+        })
+        .collect();
+    write_family(&mut out, "amdgpu_dpm_state_info",
+        "DPM power state (battery/balanced/performance). Value is constant 1; current state in label.",
+        &dpm_state_samples);
 
     out
 }
