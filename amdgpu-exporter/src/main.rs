@@ -150,6 +150,29 @@ fn parse_pcie_speed_gts(text: &str) -> Option<f64> {
     text.split_whitespace().next().and_then(|s| s.parse().ok())
 }
 
+/// Header of the kernel's `gpu_metrics` binary blob. The first four bytes are
+/// laid out identically across every `gpu_metrics_v*_*` format ever shipped:
+/// `uint16_t structure_size; uint8_t format_revision; uint8_t content_revision;`
+/// (see `include/kgd_pp_interface.h` in the Linux source).
+#[derive(Debug, PartialEq, Eq)]
+struct GpuMetricsHeader {
+    structure_size: u16,
+    format_revision: u8,
+    content_revision: u8,
+}
+
+fn read_gpu_metrics_header(path: &Path) -> Option<GpuMetricsHeader> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() < 4 {
+        return None;
+    }
+    Some(GpuMetricsHeader {
+        structure_size: u16::from_le_bytes([bytes[0], bytes[1]]),
+        format_revision: bytes[2],
+        content_revision: bytes[3],
+    })
+}
+
 // ─── Metric emission ───────────────────────────────────────
 
 /// Escape a Prometheus label value per the text exposition format.
@@ -263,6 +286,7 @@ struct Snapshot {
     power_state: String,
     dpm_level: String,
     dpm_state: String,
+    gpu_metrics: Option<GpuMetricsHeader>,
 }
 
 fn snapshot(gpu: &AmdGpu) -> Snapshot {
@@ -352,6 +376,8 @@ fn snapshot(gpu: &AmdGpu) -> Snapshot {
     let dpm_state =
         read_sysfs_string(&gpu.sysfs.join("power_dpm_state")).unwrap_or_else(|| "unknown".into());
 
+    let gpu_metrics = read_gpu_metrics_header(&gpu.sysfs.join("gpu_metrics"));
+
     Snapshot {
         temp_c,
         power_w,
@@ -377,6 +403,7 @@ fn snapshot(gpu: &AmdGpu) -> Snapshot {
         power_state,
         dpm_level,
         dpm_state,
+        gpu_metrics,
     }
 }
 
@@ -595,6 +622,34 @@ fn collect_metrics(gpus: &[AmdGpu]) -> String {
         "DPM performance level (auto/low/high/manual/etc). Value is constant 1; current level in label.",
         &dpm_level_samples,
     );
+
+    // Header of the kernel's gpu_metrics binary blob. Exposed so dashboards and
+    // downstream parsers know which `gpu_metrics_v*_*` layout the running
+    // kernel publishes for this card. Field-level parsing is deferred until
+    // per-version layouts are individually verified.
+    let gpu_metrics_samples: Vec<Sample> = gpus
+        .iter()
+        .zip(snaps.iter())
+        .filter_map(|(g, s)| {
+            s.gpu_metrics.as_ref().map(|h| Sample {
+                labels: vec![
+                    ("gpu", g.index.to_string()),
+                    ("format_revision", h.format_revision.to_string()),
+                    ("content_revision", h.content_revision.to_string()),
+                    ("structure_size_bytes", h.structure_size.to_string()),
+                ],
+                value: 1.0,
+            })
+        })
+        .collect();
+    if !gpu_metrics_samples.is_empty() {
+        write_family(
+            &mut out,
+            "amdgpu_gpu_metrics_info",
+            "Header of the kernel gpu_metrics binary blob (constant 1; layout in labels).",
+            &gpu_metrics_samples,
+        );
+    }
 
     let dpm_state_samples: Vec<Sample> = gpus
         .iter()
@@ -1092,6 +1147,42 @@ mod tests {
         assert_eq!(parse_pcie_speed_gts("8.0 GT/s PCIe"), Some(8.0));
         assert_eq!(parse_pcie_speed_gts("2.5 GT/s PCIe"), Some(2.5));
         assert_eq!(parse_pcie_speed_gts(""), None);
+    }
+
+    #[test]
+    fn read_gpu_metrics_header_parses_known_bytes() {
+        let h = read_gpu_metrics_header(&fixture_drm_root().join("card0/device/gpu_metrics"))
+            .expect("fixture should parse");
+        assert_eq!(
+            h,
+            GpuMetricsHeader {
+                structure_size: 264,
+                format_revision: 3,
+                content_revision: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn read_gpu_metrics_header_rejects_truncated_files() {
+        let dir = std::env::temp_dir().join(format!("amdgpu_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gpu_metrics_short");
+        std::fs::write(&path, b"\x01\x02\x03").unwrap();
+        assert_eq!(read_gpu_metrics_header(&path), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn collect_metrics_emits_gpu_metrics_info() {
+        let gpus = discover_gpus_in(&fixture_drm_root());
+        let body = collect_metrics(&gpus);
+        assert!(
+            body.contains(
+                r#"amdgpu_gpu_metrics_info{gpu="0",format_revision="3",content_revision="0",structure_size_bytes="264"} 1"#
+            ),
+            "expected gpu_metrics_info line; got:\n{body}"
+        );
     }
 
     #[test]
