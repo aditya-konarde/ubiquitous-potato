@@ -130,6 +130,26 @@ fn read_hwmon_f64(hwmon: Option<&PathBuf>, file: &str) -> Option<f64> {
     hwmon.and_then(|h| read_sysfs_f64(&h.join(file)))
 }
 
+/// Parse the active state from a `pp_dpm_*` table, returning the frequency in Hz.
+///
+/// Format: each line is `<index>: <freq>Mhz [*]` where `*` marks the active state.
+/// Returns None if no line is marked active or no Mhz value can be parsed.
+fn parse_dpm_active_hz(text: &str) -> Option<f64> {
+    let active = text.lines().map(str::trim_end).find(|l| l.ends_with('*'))?;
+    active.split_whitespace().find_map(|w| {
+        let n = w
+            .strip_suffix("Mhz")
+            .or_else(|| w.strip_suffix("MHz"))
+            .or_else(|| w.strip_suffix("mhz"))?;
+        n.parse::<f64>().ok().map(|v| v * 1_000_000.0)
+    })
+}
+
+/// Parse `current_link_speed` (e.g. `"16.0 GT/s PCIe"`) as gigatransfers/sec.
+fn parse_pcie_speed_gts(text: &str) -> Option<f64> {
+    text.split_whitespace().next().and_then(|s| s.parse().ok())
+}
+
 // ─── Metric emission ───────────────────────────────────────
 
 /// Escape a Prometheus label value per the text exposition format.
@@ -223,6 +243,8 @@ struct Snapshot {
     power_w: f64,
     power_avg_w: f64,
     sclk_hz: f64,
+    mclk_hz: f64,
+    fan_rpm: f64,
     gpu_util_ratio: f64,
     vram_util_ratio: f64,
     vram_total: f64,
@@ -234,6 +256,10 @@ struct Snapshot {
     gtt_used: f64,
     vddgfx_v: f64,
     vddnb_v: f64,
+    pcie_link_speed_gts: f64,
+    pcie_link_width: f64,
+    pcie_max_link_speed_gts: f64,
+    pcie_max_link_width: f64,
     power_state: String,
     dpm_level: String,
     dpm_state: String,
@@ -253,6 +279,16 @@ fn snapshot(gpu: &AmdGpu) -> Snapshot {
         .map(|uw| uw / 1_000_000.0)
         .unwrap_or(nan);
     let sclk_hz = read_hwmon_f64(h, "freq1_input").unwrap_or(nan);
+    // Memory clock: try hwmon freq2_input first (dGPU), fall back to parsing
+    // pp_dpm_mclk for the active-state marker (APU/iGPU).
+    let mclk_hz = read_hwmon_f64(h, "freq2_input")
+        .or_else(|| {
+            read_sysfs_string(&gpu.sysfs.join("pp_dpm_mclk"))
+                .as_deref()
+                .and_then(parse_dpm_active_hz)
+        })
+        .unwrap_or(nan);
+    let fan_rpm = read_hwmon_f64(h, "fan1_input").unwrap_or(nan);
     let vddgfx_v = read_hwmon_f64(h, "in0_input")
         .map(|mv| mv / 1000.0)
         .unwrap_or(nan);
@@ -294,6 +330,21 @@ fn snapshot(gpu: &AmdGpu) -> Snapshot {
         .map(|v| v as f64)
         .unwrap_or(nan);
 
+    let pcie_link_speed_gts = read_sysfs_string(&gpu.sysfs.join("current_link_speed"))
+        .as_deref()
+        .and_then(parse_pcie_speed_gts)
+        .unwrap_or(nan);
+    let pcie_link_width = read_sysfs_u64(&gpu.sysfs.join("current_link_width"))
+        .map(|w| w as f64)
+        .unwrap_or(nan);
+    let pcie_max_link_speed_gts = read_sysfs_string(&gpu.sysfs.join("max_link_speed"))
+        .as_deref()
+        .and_then(parse_pcie_speed_gts)
+        .unwrap_or(nan);
+    let pcie_max_link_width = read_sysfs_u64(&gpu.sysfs.join("max_link_width"))
+        .map(|w| w as f64)
+        .unwrap_or(nan);
+
     let power_state =
         read_sysfs_string(&gpu.sysfs.join("power_state")).unwrap_or_else(|| "unknown".into());
     let dpm_level = read_sysfs_string(&gpu.sysfs.join("power_dpm_force_performance_level"))
@@ -306,6 +357,8 @@ fn snapshot(gpu: &AmdGpu) -> Snapshot {
         power_w,
         power_avg_w,
         sclk_hz,
+        mclk_hz,
+        fan_rpm,
         gpu_util_ratio,
         vram_util_ratio,
         vram_total,
@@ -317,6 +370,10 @@ fn snapshot(gpu: &AmdGpu) -> Snapshot {
         gtt_used,
         vddgfx_v,
         vddnb_v,
+        pcie_link_speed_gts,
+        pcie_link_width,
+        pcie_max_link_speed_gts,
+        pcie_max_link_width,
         power_state,
         dpm_level,
         dpm_state,
@@ -401,6 +458,42 @@ fn collect_metrics(gpus: &[AmdGpu]) -> String {
         "amdgpu_sclk_hertz",
         "GPU shader (graphics) clock frequency in hertz.",
         &series(gpus, &snaps, |s| s.sclk_hz),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_mclk_hertz",
+        "GPU memory clock frequency in hertz (NaN if not exposed).",
+        &series(gpus, &snaps, |s| s.mclk_hz),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_fan_rpm",
+        "Cooling fan speed in revolutions per minute (NaN on cards without a fan, e.g. APUs).",
+        &series(gpus, &snaps, |s| s.fan_rpm),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_pcie_link_speed_gts",
+        "Current PCIe link speed in gigatransfers per second.",
+        &series(gpus, &snaps, |s| s.pcie_link_speed_gts),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_pcie_link_width",
+        "Current PCIe link width in lanes.",
+        &series(gpus, &snaps, |s| s.pcie_link_width),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_pcie_max_link_speed_gts",
+        "Maximum PCIe link speed the card can negotiate, in gigatransfers per second.",
+        &series(gpus, &snaps, |s| s.pcie_max_link_speed_gts),
+    );
+    write_family(
+        &mut out,
+        "amdgpu_pcie_max_link_width",
+        "Maximum PCIe link width the card can negotiate, in lanes.",
+        &series(gpus, &snaps, |s| s.pcie_max_link_width),
     );
     write_family(
         &mut out,
@@ -974,6 +1067,51 @@ mod tests {
         // After a recovery: ready again
         state.record_scrape(Duration::from_millis(1), true);
         assert!(state.is_ready());
+    }
+
+    #[test]
+    fn parse_dpm_active_picks_starred_line() {
+        let table = "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz *\n";
+        assert_eq!(parse_dpm_active_hz(table), Some(1_000_000_000.0));
+    }
+
+    #[test]
+    fn parse_dpm_active_returns_none_when_no_active() {
+        assert_eq!(parse_dpm_active_hz("0: 400Mhz \n1: 800Mhz \n"), None);
+    }
+
+    #[test]
+    fn parse_dpm_active_handles_uppercase_mhz_variants() {
+        assert_eq!(parse_dpm_active_hz("0: 1500MHz *"), Some(1_500_000_000.0));
+        assert_eq!(parse_dpm_active_hz("0: 1500mhz *"), Some(1_500_000_000.0));
+    }
+
+    #[test]
+    fn parse_pcie_speed_handles_known_strings() {
+        assert_eq!(parse_pcie_speed_gts("16.0 GT/s PCIe"), Some(16.0));
+        assert_eq!(parse_pcie_speed_gts("8.0 GT/s PCIe"), Some(8.0));
+        assert_eq!(parse_pcie_speed_gts("2.5 GT/s PCIe"), Some(2.5));
+        assert_eq!(parse_pcie_speed_gts(""), None);
+    }
+
+    #[test]
+    fn collect_metrics_emits_new_coverage_metrics() {
+        let gpus = discover_gpus_in(&fixture_drm_root());
+        let body = collect_metrics(&gpus);
+        let lines: Vec<&str> = body.lines().collect();
+        let has = |needle: &str| {
+            assert!(
+                lines.contains(&needle),
+                "expected line `{needle}` not found in:\n{body}"
+            );
+        };
+
+        has(r#"amdgpu_mclk_hertz{gpu="0"} 1600000000"#);
+        has(r#"amdgpu_fan_rpm{gpu="0"} 2400"#);
+        has(r#"amdgpu_pcie_link_speed_gts{gpu="0"} 8"#);
+        has(r#"amdgpu_pcie_link_width{gpu="0"} 8"#);
+        has(r#"amdgpu_pcie_max_link_speed_gts{gpu="0"} 16"#);
+        has(r#"amdgpu_pcie_max_link_width{gpu="0"} 16"#);
     }
 
     #[test]
