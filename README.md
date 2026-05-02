@@ -15,6 +15,7 @@ Use everything here at your own risk. No warranties, guarantees, support, mainte
 | [`amdgpu-exporter`](./amdgpu-exporter/) | Prometheus exporter for AMD GPU telemetry from Linux sysfs. | Functional, best documented project in this repo. | MIT, see `amdgpu-exporter/LICENSE` |
 | [`younope`](./younope/) | Chrome extension that blocks selected YouTube channels and hides their videos. | Experimental browser extension. | GPLv3 via root `LICENSE` |
 | [`redirectit`](./redirectit/) | Minimal Chrome extension that redirects `www.reddit.com` to `old.reddit.com`. | Tiny utility extension. | GPLv3 via root `LICENSE` |
+| [`simply-mail`](./simply-mail/) | Browser extension that creates a cleaner, decluttered email experience. | Experimental browser extension. | GPLv3 via root `LICENSE` |
 
 ## Repository layout
 
@@ -22,6 +23,7 @@ Use everything here at your own risk. No warranties, guarantees, support, mainte
 amdgpu-exporter/  Rust Prometheus exporter plus Grafana dashboard
 younope/          Manifest V3 YouTube channel blocker extension
 redirectit/       Manifest V3 Reddit redirect extension
+simply-mail/      Browser extension for cleaner email workflows
 ```
 
 ## Development checks
@@ -44,9 +46,15 @@ Validate JSON and JavaScript syntax from the repository root:
 python3 -m json.tool younope/manifest.json >/dev/null
 python3 -m json.tool redirectit/manifest.json >/dev/null
 python3 -m json.tool redirectit/rules.json >/dev/null
+python3 -m json.tool simply-mail/manifest.json >/dev/null
 node --check younope/content.js
 node --check younope/popup.js
 node --check younope/options.js
+cd simply-mail
+npm ci --include=dev
+npm run typecheck
+npm test
+npm run build
 ```
 
 ## Notes

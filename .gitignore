@@ -14,6 +14,13 @@
 *.swp
 *.swo
 .codex
+**/.codex
+**/.claude/
+**/.bg-shell/
+**/.gsd/
+**/.gstack/
+**/.orchids/
+**/temp_vision_images/
 .env
 .env.*
 
