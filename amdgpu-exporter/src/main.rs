@@ -441,7 +441,7 @@ fn parse_args() -> (String, u16) {
                 std::process::exit(0);
             }
             "--version" | "-V" => {
-                println!("amdgpu-exporter 0.1.0");
+                println!(concat!("amdgpu-exporter ", env!("CARGO_PKG_VERSION")));
                 std::process::exit(0);
             }
             _ => {}
