@@ -25,7 +25,12 @@ struct AmdGpu {
 
 /// Discover all AMD GPUs via `/sys/class/drm/card*/device/uevent`.
 fn discover_gpus() -> Vec<AmdGpu> {
-    let drm = Path::new("/sys/class/drm");
+    discover_gpus_in(Path::new("/sys/class/drm"))
+}
+
+/// Discover AMD GPUs under the given DRM root directory. Useful for tests with
+/// a fixture tree.
+fn discover_gpus_in(drm: &Path) -> Vec<AmdGpu> {
     let Ok(entries) = fs::read_dir(drm) else {
         return Vec::new();
     };
@@ -540,5 +545,152 @@ fn main() {
         if let Err(e) = request.respond(response) {
             log::warn!("Failed to send response for {url}: {e}");
         }
+    }
+}
+
+// ─── Tests ─────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn fixture_drm_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("sysfs_drm")
+    }
+
+    #[test]
+    fn discover_finds_amdgpu_card_in_fixture() {
+        let gpus = discover_gpus_in(&fixture_drm_root());
+        assert_eq!(gpus.len(), 1, "expected exactly one fixture GPU");
+        let g = &gpus[0];
+        assert_eq!(g.index, 0);
+        assert_eq!(g.card_name, "card0");
+        assert_eq!(g.pci_id, "1002:1586");
+        assert_eq!(g.vbios, "TEST-VBIOS-1");
+        assert_eq!(g.device_name, "AMD GPU [0x1586]");
+        assert!(g.hwmon.is_some(), "hwmon directory should be discovered");
+    }
+
+    #[test]
+    fn discover_returns_empty_for_missing_root() {
+        let gpus = discover_gpus_in(Path::new("/nonexistent/drm/root"));
+        assert!(gpus.is_empty());
+    }
+
+    #[test]
+    fn collect_metrics_format_invariants() {
+        let gpus = discover_gpus_in(&fixture_drm_root());
+        let body = collect_metrics(&gpus);
+
+        // Each metric family must appear with HELP and TYPE exactly once.
+        let mut help_count: HashMap<&str, u32> = HashMap::new();
+        let mut type_count: HashMap<&str, u32> = HashMap::new();
+        for line in body.lines() {
+            if let Some(rest) = line.strip_prefix("# HELP ") {
+                let name = rest.split_whitespace().next().unwrap();
+                *help_count.entry(name).or_default() += 1;
+            } else if let Some(rest) = line.strip_prefix("# TYPE ") {
+                let name = rest.split_whitespace().next().unwrap();
+                *type_count.entry(name).or_default() += 1;
+            }
+        }
+        for (name, count) in &help_count {
+            assert_eq!(*count, 1, "HELP for {name} should appear once, found {count}");
+        }
+        for (name, count) in &type_count {
+            assert_eq!(*count, 1, "TYPE for {name} should appear once, found {count}");
+        }
+        assert_eq!(
+            help_count.keys().collect::<std::collections::HashSet<_>>(),
+            type_count.keys().collect::<std::collections::HashSet<_>>(),
+            "every HELP must have a matching TYPE"
+        );
+
+        // Every sample line must match the exposition grammar.
+        for line in body.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (head, value) = line.rsplit_once(' ').expect("sample needs name and value");
+            // Value: number, NaN, +Inf, or -Inf.
+            assert!(
+                value == "NaN"
+                    || value == "+Inf"
+                    || value == "-Inf"
+                    || value.parse::<f64>().is_ok(),
+                "unparseable sample value: {line:?}"
+            );
+            // Head: metric name, optionally followed by {labels}.
+            let metric_name = head.split('{').next().unwrap();
+            assert!(
+                metric_name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "metric name must be lowercase snake_case: {metric_name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn collect_metrics_emits_expected_values() {
+        let gpus = discover_gpus_in(&fixture_drm_root());
+        let body = collect_metrics(&gpus);
+        let lines: Vec<&str> = body.lines().collect();
+        let has = |needle: &str| {
+            assert!(
+                lines.contains(&needle),
+                "expected line `{needle}` not found in:\n{body}"
+            );
+        };
+
+        has("amdgpu_count 1");
+        has(r#"amdgpu_info{gpu="0",pci_id="1002:1586",device="AMD GPU [0x1586]",vbios="TEST-VBIOS-1",card="card0"} 1"#);
+        has(r#"amdgpu_temperature_celsius{gpu="0"} 65"#);
+        has(r#"amdgpu_power_draw_watts{gpu="0"} 25"#);
+        has(r#"amdgpu_power_average_watts{gpu="0"} 24"#);
+        has(r#"amdgpu_sclk_hertz{gpu="0"} 2000000000"#);
+        has(r#"amdgpu_gpu_utilization_ratio{gpu="0"} 0.5"#);
+        has(r#"amdgpu_vram_utilization_ratio{gpu="0"} 0.5"#);
+        has(r#"amdgpu_vram_total_bytes{gpu="0"} 1073741824"#);
+        has(r#"amdgpu_vram_used_bytes{gpu="0"} 536870912"#);
+        has(r#"amdgpu_vram_free_bytes{gpu="0"} 536870912"#);
+        has(r#"amdgpu_vddgfx_volts{gpu="0"} 1"#);
+        has(r#"amdgpu_vddnb_volts{gpu="0"} 0"#);
+        has(r#"amdgpu_power_state_info{gpu="0",state="D0"} 1"#);
+        has(r#"amdgpu_dpm_performance_level_info{gpu="0",level="auto"} 1"#);
+        has(r#"amdgpu_dpm_state_info{gpu="0",state="balanced"} 1"#);
+    }
+
+    #[test]
+    fn missing_sysfs_files_emit_nan_not_zero() {
+        // Construct an AmdGpu that points to a non-existent sysfs tree.
+        let gpu = AmdGpu {
+            index: 0,
+            card_name: "card0".into(),
+            sysfs: PathBuf::from("/nonexistent/dev"),
+            hwmon: Some(PathBuf::from("/nonexistent/hwmon")),
+            pci_id: "0000:0000".into(),
+            device_name: "test".into(),
+            vbios: "test".into(),
+        };
+        let body = collect_metrics(&[gpu]);
+        assert!(
+            body.contains(r#"amdgpu_temperature_celsius{gpu="0"} NaN"#),
+            "expected NaN for missing temperature reading; got:\n{body}"
+        );
+        assert!(
+            body.contains(r#"amdgpu_vram_total_bytes{gpu="0"} NaN"#),
+            "expected NaN for missing vram reading; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn label_value_escaping() {
+        let escaped = escape_prom_label_value(r#"a\b"c"#);
+        assert_eq!(escaped, r#"a\\b\"c"#);
+        let escaped_nl = escape_prom_label_value("line1\nline2");
+        assert_eq!(escaped_nl, r"line1\nline2");
     }
 }
